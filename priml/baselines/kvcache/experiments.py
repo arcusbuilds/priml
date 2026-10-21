@@ -8,6 +8,7 @@ dtype. Every later experiment forks a named parent and changes ONE thing:
     exp000  bf16 weights, bf16 KV cache, 4096-token context
       +-- exp001  int8 codes, one float32 scale per token, packed in k/v
       +-- exp002  e2m1 (fp4) codes, one float32 scale per token, packed in k/v
+      +-- exp003  exp002's rows read by a fused Triton attention kernel
 
 Launch::
 
@@ -28,7 +29,8 @@ Score:
 
 A fork may change:
   ``allocate_cache``: the cache's dtype, layout, quantization, and the
-  arithmetic that reads it back.
+  arithmetic that reads it back -- including, for a fused read path, the
+  attention kernel that consumes the cache's served rows.
 
 A fork may not change:
   The model, its weights' dtype, the prompts, the context length, or the
@@ -39,7 +41,10 @@ from __future__ import annotations
 
 from priml.baselines.kvcache.decode import DecodeBenchmark
 from priml.baselines.kvcache.fp4 import fp4_layer_cache
+from priml.baselines.kvcache.fp4_fused import Fp4TritonAttention, fp4_fused_layer_cache
 from priml.baselines.kvcache.int8 import int8_layer_cache
+from priml.model.attention.attention import Attention
+from priml.model.transformer.block import TransformerBlock
 
 
 def exp000() -> DecodeBenchmark.Config:
@@ -200,4 +205,74 @@ def exp002() -> DecodeBenchmark.Config:
     """
     cfg = exp000()
     cfg.allocate_cache = fp4_layer_cache
+    return cfg
+
+
+def exp003() -> DecodeBenchmark.Config:
+    """Serve exp002's packed fp4 rows straight to a fused attention kernel.
+
+    ``allocate_cache`` becomes :func:`fp4_fused_layer_cache`: the same packed
+    e2m1 rows and in-row float32 scales as exp002, but the cache serves the
+    packed slices themselves. ``attn_kernel`` becomes
+    :class:`Fp4TritonAttention`, whose Triton kernel unpacks each byte
+    through a 16-entry table in registers, scales by the row's float32 scale,
+    and attends -- the dequantized cache-sized copy exp001 and exp002
+    materialize every step is never written. The model, its dtype, the
+    prompts, the context length, and the harness are exp000's. Cache storage
+    matches exp002: 1152 bytes per token, versus exp000's 4096. The allocator
+    and the kernel consuming its packed rows differ from exp002.
+
+    Hypothesis:
+      exp002's −41% is the dequantized copy, not the codes: with the
+      materialization pass gone, decode reads packed rows (~0.56 B per
+      value including the scale's share) instead of a bf16 rewrite (2 B),
+      so exp003 beats exp000's tokens per second at exp002's cache bytes.
+      Frozen before measuring, on the same seed and session: SUCCESS is
+      exp003 >= exp000 (the ladder's speed sign flips); FAILURE is exp003
+      <= exp001 (fusion did not pay for its unpack); between the two is
+      reported as a partial result with no sign-flip claim.
+
+    References:
+      https://arxiv.org/abs/2402.02750
+        Liu et al. 2024. KIVI: A tuning-free asymmetric 2bit quantization
+        for KV cache. The motivation this rung tests end to end: packed
+        codes only win when attention reads them directly.
+      priml.baselines.nanochat.exp016
+        The house precedent for a Triton kernel entering a ladder as an
+        experiment rung rather than a core-model change.
+
+    Results:
+      AUTHOR-REPORTED / UNVERIFIED: 2026-10-21, same A100 box, seed 20261021,
+      two runs: exp003 690.6-692.1
+      tokens/sec, p99 13.9 ms, kv 37748736 bytes -- against that session's
+      exp000 1068.8-1070.9 and exp002 634.8-638.6. FAILURE by the frozen
+      rule: fusion beats exp002 by 8.6% and cuts p99, but lands below
+      exp001 and recovers only ~13% of the gap to exp000. The author also
+      reported max abs kernel-output difference 0.00195 against SDPA over
+      _dequantized rows under the ladder's masks.
+      A follow-up probe changed the head counts
+      (``num_heads_kv = 8``, ``kv_groups = 1``, same seed): 703.4-705.9
+      tokens/sec -- +1.9% over exp003, still ~36% under exp000's same-
+      session 1106-1109. Raw timing artifacts and a profiler trace are not
+      included, and these results have not been reproduced after the fixes.
+      The timings do not isolate a dominant cost or establish a CPU/launch
+      bottleneck. Packed storage is 1152 * 4096 * 8 = 37748736 bytes (36 MiB)
+      for the batch at full context, before GQA expansion and scale clones;
+      allocated bytes are not measured memory traffic. The current path
+      still expands packed GQA heads and clones scales into float32 tensors.
+      Read traffic, quantized writes, and launch overhead remain hypotheses
+      requiring profiling and controlled comparisons.
+
+    Returns:
+      config: exp000 with the packed-served fp4 cache and the fused Triton
+        attention kernel.
+
+    """
+    cfg = exp000()
+    cfg.allocate_cache = fp4_fused_layer_cache
+    block = cfg.model.block
+    assert isinstance(block, TransformerBlock.Config)
+    attn = block.attn
+    assert isinstance(attn, Attention.Config)
+    attn.attn_kernel = Fp4TritonAttention.Config()
     return cfg
